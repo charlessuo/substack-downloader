@@ -1,6 +1,9 @@
 import os
+import re
 import time
 import json
+import base64
+import mimetypes
 import argparse
 import requests
 from bs4 import BeautifulSoup
@@ -11,9 +14,57 @@ from urllib.parse import urlparse, unquote, urljoin
 
 load_dotenv()
 
+# Name of the per-handle manifest used for de-duplication.
+MANIFEST_NAME = ".downloaded.json"
+
+
+def resolve_handle(handle):
+    """Turn a handle/URL into a (base_url, handle_name) pair.
+
+    Accepts any of:
+      - https://read.substack.com  (full URL)
+      - read.substack.com          (bare domain)
+      - lennysnewsletter.com       (custom domain)
+      - platformer                 (bare substack handle -> platformer.substack.com)
+    """
+    handle = handle.strip()
+    if not handle:
+        return None, None
+
+    if "://" in handle:
+        base_url = handle
+    elif "." in handle:
+        base_url = f"https://{handle}"
+    else:
+        base_url = f"https://{handle}.substack.com"
+
+    base_url = base_url.rstrip("/")
+    domain = urlparse(base_url).netloc
+
+    # Friendly short name used for folders and filenames.
+    if domain.endswith(".substack.com"):
+        name = domain[: -len(".substack.com")]
+    else:
+        name = domain[4:] if domain.startswith("www.") else domain
+
+    return base_url, name
+
+
+def sanitize(text, max_len=80):
+    """Make a string safe to use as a filename component."""
+    text = text or "untitled"
+    # Keep alphanumerics, spaces, dashes and underscores; drop the rest.
+    text = "".join(c for c in text if c.isalnum() or c in (" ", "-", "_")).strip()
+    # Collapse whitespace runs into single dashes.
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-_")
+    return (text or "untitled")[:max_len]
+
+
 class SubstackScraper:
-    def __init__(self, base_url, cookie=None):
+    def __init__(self, base_url, handle_name, cookie=None):
         self.base_url = base_url.rstrip('/')
+        self.handle_name = handle_name
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -21,15 +72,15 @@ class SubstackScraper:
         if cookie:
             # Decode cookie if it's URL encoded (e.g. starts with s%3A)
             cookie = unquote(cookie)
-            
+
             # Set cookie for the specific domain of the newsletter
             # This handles custom domains (e.g. robkhenderson.com) where .substack.com cookies are not sent
             domain = urlparse(base_url).netloc
-            
+
             # Custom domains (like robkhenderson.com) use 'connect.sid'
             # Substack subdomains (like read.substack.com) use 'substack.sid'
             cookie_name = 'substack.sid' if 'substack.com' in domain else 'connect.sid'
-            
+
             self.session.cookies.set(cookie_name, cookie, domain=domain)
 
     def load_session_file(self, session_file):
@@ -37,19 +88,19 @@ class SubstackScraper:
         try:
             with open(session_file, 'r') as f:
                 data = json.load(f)
-            
+
             # Update User-Agent
             if 'user_agent' in data:
                 self.session.headers.update({'User-Agent': data['user_agent']})
-            
+
             # Load Cookies
             if 'cookies' in data:
                 for cookie in data['cookies']:
                     # We only care about the name/value and domain matching
                     # Requests wants a specific format, but setting simple dicts often works
                     self.session.cookies.set(
-                        cookie['name'], 
-                        cookie['value'], 
+                        cookie['name'],
+                        cookie['value'],
                         domain=cookie['domain'],
                         path=cookie['path']
                     )
@@ -87,86 +138,102 @@ class SubstackScraper:
             print(f"Error fetching post {slug}: {e}")
             return None
 
-    def download_image(self, img_url, assets_dir):
-        """Download an image and return its local filename."""
+    def embed_image(self, img_url):
+        """Download an image and return it as an inline base64 data URI."""
         try:
-            # Parse URL to get filename
-            parsed = urlparse(img_url)
-            filename = os.path.basename(parsed.path)
-            
-            # Remove query parameters if present
-            if '?' in filename:
-                filename = filename.split('?')[0]
-                
-            if not filename or not filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                filename = f"image_{int(time.time())}_{len(os.listdir(assets_dir))}.jpg"
-
-            # Check if likely a relative URL or needs base
             if not img_url.startswith(('http:', 'https:')):
                 img_url = urljoin(self.base_url, img_url)
 
-            local_path = os.path.join(assets_dir, filename)
-            
-            # Don't re-download if exists
-            if os.path.exists(local_path):
-                return filename
-
             response = self.session.get(img_url, stream=True)
             response.raise_for_status()
-            
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            return filename
+
+            # Prefer the server-reported content type, fall back to the extension.
+            content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+            if not content_type or not content_type.startswith('image/'):
+                guessed, _ = mimetypes.guess_type(urlparse(img_url).path)
+                content_type = guessed or 'image/jpeg'
+
+            encoded = base64.b64encode(response.content).decode('ascii')
+            return f"data:{content_type};base64,{encoded}"
         except Exception as e:
-            print(f"Failed to download image {img_url}: {e}")
+            print(f"Failed to embed image {img_url}: {e}")
             return None
 
-    def save_post(self, post, output_dir, html_only=False, md_only=False):
-        """Save post content to file (HTML and/or Markdown) with local images."""
-        if not post:
-            return
+    def download_video(self, video_url, assets_dir, index):
+        """Download a video into the assets dir and return its relative path."""
+        try:
+            if not video_url.startswith(('http:', 'https:')):
+                video_url = urljoin(self.base_url, video_url)
 
-        date = post.get('post_date', '').split('T')[0]
+            parsed = urlparse(video_url)
+            filename = os.path.basename(parsed.path).split('?')[0]
+            if not filename:
+                filename = f"video_{index}.mp4"
+
+            os.makedirs(assets_dir, exist_ok=True)
+            local_path = os.path.join(assets_dir, filename)
+
+            if not os.path.exists(local_path):
+                response = self.session.get(video_url, stream=True)
+                response.raise_for_status()
+                with open(local_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            return f"assets/{filename}"
+        except Exception as e:
+            print(f"Failed to download video {video_url}: {e}")
+            return None
+
+    def save_post(self, post, output_dir):
+        """Save post content to file (HTML and/or Markdown), inlining images.
+
+        Returns the base filename used, or None if nothing was written.
+        """
+        if not post:
+            return None
+
+        date = post.get('post_date', '').split('T')[0] or 'undated'
         slug = post.get('slug', 'unknown')
         title = post.get('title', 'Untitled')
-        
-        # Create filename safely
-        safe_slug = "".join([c for c in slug if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
-        filename_base = f"{date}_{safe_slug}"
-        
+
         html_content = post.get('body_html', '')
         if not html_content:
-            return
+            return None
 
-        # Prepare assets directory
+        # Filename: <post-date>_<handle>_<title>
+        filename_base = f"{date}_{sanitize(self.handle_name, 40)}_{sanitize(title)}"
+
         assets_dir = os.path.join(output_dir, "assets")
-        if not os.path.exists(assets_dir):
-            os.makedirs(assets_dir)
 
-        # Process HTML with BeautifulSoup to find and download images
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # Dictionary to map original URLs to local filenames for Markdown conversion
-        image_map = {}
 
+        # Inline every image as a base64 data URI so the output file is
+        # self-contained and needs no assets folder.
         for img in soup.find_all('img'):
             src = img.get('src')
-            if src:
-                local_filename = self.download_image(src, assets_dir)
-                if local_filename:
-                    # Update HTML src to point to local file (relative path)
-                    img['src'] = f"assets/{local_filename}"
-                    # Remove srcset to force browser to use src
-                    if img.has_attr('srcset'):
-                        del img['srcset']
-                    
-                    image_map[src] = f"assets/{local_filename}"
+            if not src:
+                continue
+            data_uri = self.embed_image(src)
+            if data_uri:
+                img['src'] = data_uri
+                # Remove srcset so the browser uses the embedded src.
+                if img.has_attr('srcset'):
+                    del img['srcset']
 
-        # 1. Save HTML (if not disabled)
-        if not md_only:
+        # Videos can't be inlined sensibly, so download them to assets/.
+        for i, video in enumerate(soup.find_all('video')):
+            sources = video.find_all('source') or [video]
+            for source in sources:
+                src = source.get('src')
+                if not src:
+                    continue
+                local = self.download_video(src, assets_dir, i)
+                if local:
+                    source['src'] = local
+
+        # 1. Save HTML
+        if not self.md_only:
             # Modern, Reader-Mode style CSS
             css = """
             <style>
@@ -211,58 +278,81 @@ class SubstackScraper:
                 }
             </style>
             """
-            
-            # We save the modified soup with local image links
+
             full_html = f"<html><head><title>{title}</title>{css}</head><body><h1>{title}</h1>{soup.prettify()}</body></html>"
             with open(os.path.join(output_dir, f"{filename_base}.html"), 'w') as f:
                 f.write(full_html)
 
-        # 2. Save Markdown (if not disabled)
-        if not html_only:
+        # 2. Save Markdown
+        if not self.html_only:
             from markdownify import markdownify
-            
-            # Convert the MODIFIED html (with local links) to Markdown
-            # This ensures the markdown points to assets/image.jpg
+
             md_content = markdownify(str(soup), heading_style="ATX")
-            
+
             # Add metadata header
             full_md = f"# {title}\n\nDate: {date}\nURL: {self.base_url}/p/{slug}\n\n{md_content}"
-            
+
             with open(os.path.join(output_dir, f"{filename_base}.md"), 'w') as f:
                 f.write(full_md)
 
+        return filename_base
 
-    def scrape(self, output_dir="archive", limit=None, skip_podcasts=False, html_only=False, md_only=False):
-        """Main scraping loop."""
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+    def _load_manifest(self, output_dir):
+        """Load the set of already-downloaded post ids for de-duplication."""
+        path = os.path.join(output_dir, MANIFEST_NAME)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
-        print(f"Starting scrape for {self.base_url}...")
-        
+    def _save_manifest(self, output_dir, manifest):
+        path = os.path.join(output_dir, MANIFEST_NAME)
+        with open(path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+    def scrape(self, output_dir, limit=None, skip_podcasts=False,
+               html_only=False, md_only=False):
+        """Main scraping loop for a single newsletter."""
+        self.html_only = html_only
+        self.md_only = md_only
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # De-dup manifest: stable post id -> saved filename.
+        manifest = self._load_manifest(output_dir)
+
+        print(f"Starting scrape for {self.base_url} (handle: {self.handle_name})...")
+
         offset = 0
         batch_size = 12
-        total_fetched = 0
-        
-        while True:
-            if limit and total_fetched >= limit:
-                break
-                
-            batch_limit = batch_size
-            if limit and (limit - total_fetched) < batch_size:
-                batch_limit = limit - total_fetched
+        downloaded = 0
+        skipped_dupes = 0
 
-            print(f"Fetching posts {offset} to {offset + batch_limit}...")
-            posts = self.get_archive(limit=batch_limit, offset=offset)
-            
+        while True:
+            if limit and downloaded >= limit:
+                break
+
+            print(f"Fetching posts {offset} to {offset + batch_size}...")
+            posts = self.get_archive(limit=batch_size, offset=offset)
+
             if not posts:
                 break
-                
+
             for post_summary in tqdm(posts):
-                if limit and total_fetched >= limit:
+                if limit and downloaded >= limit:
                     break
-                    
+
                 slug = post_summary.get('slug')
                 if not slug:
+                    continue
+
+                # De-duplicate: skip posts we've already saved.
+                post_id = str(post_summary.get('id') or slug)
+                if post_id in manifest:
+                    skipped_dupes += 1
                     continue
 
                 # Check if it's a podcast
@@ -270,69 +360,112 @@ class SubstackScraper:
                 if skip_podcasts and is_podcast:
                     print(f"Skipping podcast: {slug}")
                     continue
-                    
+
                 # Small delay to be nice
                 time.sleep(1)
-                
+
                 full_post = self.get_post(slug)
                 if full_post:
-                    self.save_post(full_post, output_dir, html_only=html_only, md_only=md_only)
-                    total_fetched += 1
-            
-            # Since we might skip posts, we can't just rely on total_fetched for offset
-            # We must consistently move the offset by the number of posts fetched from API
+                    saved = self.save_post(full_post, output_dir)
+                    if saved:
+                        manifest[post_id] = saved
+                        self._save_manifest(output_dir, manifest)
+                        downloaded += 1
+
             offset += len(posts)
-            
-            if len(posts) < batch_limit:  # No more posts (checked against what we asked for)
+
+            if len(posts) < batch_size:  # No more posts
                 break
 
-        print(f"Scraping complete. Downloaded {total_fetched} posts.")
+        print(
+            f"Done: {self.handle_name} -> downloaded {downloaded} new post(s), "
+            f"skipped {skipped_dupes} already-archived."
+        )
+        return downloaded
+
+
+def read_handles_file(path):
+    """Read a handles file (one handle/URL per line; '#' comments allowed)."""
+    handles = []
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.split('#', 1)[0].strip()
+            if line:
+                handles.append(line)
+    return handles
+
+
+def find_session_file(domain):
+    """Pick the best available Playwright session file for a domain."""
+    specific = f"substack_session_{domain}.json"
+    default = "substack_session.json"
+    if os.path.exists(specific):
+        return specific
+    if os.path.exists(default):
+        return default
+    return None
+
+
+def process_handle(handle, args, output_root):
+    """Resolve, authenticate, and scrape a single handle."""
+    base_url, name = resolve_handle(handle)
+    if not base_url:
+        return 0
+
+    scraper = SubstackScraper(base_url, name, args.cookie)
+
+    # Auth priority: 1) CLI cookie  2) session file  3) .env cookie
+    if not args.cookie:
+        domain = urlparse(base_url).netloc
+        session_file = find_session_file(domain)
+        if session_file:
+            scraper.load_session_file(session_file)
+        else:
+            env_cookie = os.getenv("SUBSTACK_SID")
+            if env_cookie:
+                scraper = SubstackScraper(base_url, name, env_cookie)
+
+    output_dir = os.path.join(output_root, sanitize(name, 60))
+    return scraper.scrape(
+        output_dir=output_dir,
+        limit=args.limit,
+        skip_podcasts=args.skip_podcasts,
+        html_only=args.html_only,
+        md_only=args.md_only,
+    )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape a Substack newsletter.")
-    parser.add_argument("--url", required=True, help="Base URL of the Substack (e.g., https://read.substack.com)")
+    parser = argparse.ArgumentParser(description="Scrape one or more Substack newsletters.")
+    parser.add_argument("--url", help="Base URL or handle of a single Substack (e.g., https://read.substack.com)")
+    parser.add_argument("--file", help="Path to a text file with one handle/URL per line")
+    parser.add_argument("--output", default="output", help="Output directory (default: output)")
     parser.add_argument("--cookie", help="substack.sid cookie (optional, overrides .env)")
-    parser.add_argument("--limit", type=int, help="Limit number of posts to scrape")
+    parser.add_argument("--limit", type=int, help="Limit number of NEW posts to scrape per newsletter")
     parser.add_argument("--skip-podcasts", action="store_true", help="Skip downloading podcast episodes")
     parser.add_argument("--html-only", action="store_true", help="Save only HTML files")
     parser.add_argument("--md-only", action="store_true", help="Save only Markdown files")
-    
+
     args = parser.parse_args()
 
-    # Priority:
-    # 1. Command line cookie
-    # 2. Session file (from login.py)
-    # 3. .env cookie
-    
-    cookie = args.cookie
-    
-    # Priority for session file:
-    # 1. substack_session_{domain}.json
-    # 2. substack_session.json
-    
-    from urllib.parse import urlparse
-    domain = urlparse(args.url).netloc
-    
-    session_file_specific = f"substack_session_{domain}.json"
-    session_file_default = "substack_session.json"
-    
-    scraper = SubstackScraper(args.url, cookie)
-    
-    if not cookie:
-        if os.path.exists(session_file_specific):
-            scraper.load_session_file(session_file_specific)
-        elif os.path.exists(session_file_default):
-             scraper.load_session_file(session_file_default)
-        else:
-             cookie = os.getenv("SUBSTACK_SID")
-             if cookie:
-                 scraper = SubstackScraper(args.url, cookie)
-    
-    # Create a nice output directory name from the URL
-    domain = urlparse(args.url).netloc
-    output_dir = os.path.join("archive", domain)
-    
-    scraper.scrape(output_dir=output_dir, limit=args.limit, skip_podcasts=args.skip_podcasts, html_only=args.html_only, md_only=args.md_only)
+    if not args.url and not args.file:
+        parser.error("Provide --url for a single newsletter or --file for a list of handles.")
+
+    handles = []
+    if args.file:
+        handles.extend(read_handles_file(args.file))
+    if args.url:
+        handles.append(args.url)
+
+    if not handles:
+        parser.error("No handles found to scrape.")
+
+    total = 0
+    for handle in handles:
+        total += process_handle(handle, args, args.output)
+
+    print(f"\nAll done. {total} new post(s) downloaded across {len(handles)} newsletter(s).")
+
 
 if __name__ == "__main__":
     main()

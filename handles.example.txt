@@ -1,0 +1,6 @@
+# One newsletter per line. Lines starting with '#' are ignored.
+# Any of these forms work:
+
+https://read.substack.com      # full URL
+newsletter.pragmaticengineer.com  # custom domain
+platformer                     # bare handle -> platformer.substack.com
