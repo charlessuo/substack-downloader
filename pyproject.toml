@@ -1,0 +1,18 @@
+[project]
+name = "substack-downloader"
+version = "0.2.0"
+description = "Archive Substack newsletters you are subscribed to, for offline reading."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "requests",
+    "beautifulsoup4",
+    "tqdm",
+    "python-dotenv",
+    "playwright",
+    "markdownify",
+]
+
+[tool.uv]
+package = false
