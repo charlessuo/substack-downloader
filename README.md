@@ -16,6 +16,7 @@ A tool to **archive** Substack newsletters you are currently subscribed to. This
 ## Features
 
 - **Personal Archive**: Download all posts from a newsletter to your local machine.
+- **Single Post**: Pass a reader URL (`https://substack.com/home/post/p-<id>`) to download just that one post.
 - **Bulk Mode**: Pass a text file of handles (`--file`) to archive many newsletters in one run.
 - **De-duplication**: Remembers what it has already downloaded, so re-running only fetches new posts.
 - **Paid Content Support**: Authenticates using your existing subscription to archive subscriber-only posts.
@@ -86,6 +87,14 @@ which expands to `platformer.substack.com`).
 ```bash
 uv run scraper.py --url https://read.substack.com
 ```
+
+**Single Post** (from a Substack reader URL):
+```bash
+uv run scraper.py --url https://substack.com/home/post/p-201072791
+```
+These centralized reader URLs reference a post by numeric id. The tool resolves
+the id to its publication and downloads just that one post (into the matching
+newsletter folder), rather than archiving the whole newsletter.
 
 **Bulk Scrape** (many newsletters from a file):
 ```bash
