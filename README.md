@@ -144,16 +144,21 @@ can safely re-run on a schedule to keep your archive up to date.
 ## Output
 
 Downloaded posts are saved in the `output/` directory, with one subfolder per
-newsletter handle. Each article is named `<post-date>_<handle>_<title>`. Images
-are embedded directly in the files, so there is no `assets/` image folder;
-videos (if any) are downloaded into a per-newsletter `assets/` folder.
+newsletter handle. Within each handle, output is sorted by type: Markdown files
+go in `md/` and HTML files in `html/`. Each article is named
+`<post-date>_<handle>_<title>`. Images are embedded directly in the files, so
+there is no `assets/` image folder; videos (if any) are downloaded into a
+per-newsletter `assets/` folder shared by both formats.
 
 ```
 output/
 ├── read/
 │   ├── .downloaded.json
-│   ├── 2023-10-01_read_some-post-title.md
-│   └── 2023-10-01_read_some-post-title.html
+│   ├── md/
+│   │   └── 2023-10-01_read_some-post-title.md
+│   ├── html/
+│   │   └── 2023-10-01_read_some-post-title.html
+│   └── assets/        # videos only, if any
 ├── platformer/
 │   └── ...
 └── ...
