@@ -237,7 +237,8 @@ class SubstackScraper:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
 
-            return f"assets/{filename}"
+            # md/ and html/ files live one level below the assets dir.
+            return f"../assets/{filename}"
         except Exception as e:
             print(f"Failed to download video {video_url}: {e}")
             return None
@@ -261,7 +262,11 @@ class SubstackScraper:
         # Filename: <post-date>_<handle>_<title>
         filename_base = f"{date}_{sanitize(self.handle_name, 40)}_{sanitize(title)}"
 
+        # Sort output by type into subfolders; assets are shared at the handle
+        # root and referenced from md/ and html/ files via "../assets/".
         assets_dir = os.path.join(output_dir, "assets")
+        html_dir = os.path.join(output_dir, "html")
+        md_dir = os.path.join(output_dir, "md")
 
         soup = BeautifulSoup(html_content, 'html.parser')
 
@@ -337,7 +342,8 @@ class SubstackScraper:
             """
 
             full_html = f"<html><head><title>{title}</title>{css}</head><body><h1>{title}</h1>{soup.prettify()}</body></html>"
-            with open(os.path.join(output_dir, f"{filename_base}.html"), 'w') as f:
+            os.makedirs(html_dir, exist_ok=True)
+            with open(os.path.join(html_dir, f"{filename_base}.html"), 'w') as f:
                 f.write(full_html)
 
         # 2. Save Markdown
@@ -349,7 +355,8 @@ class SubstackScraper:
             # Add metadata header
             full_md = f"# {title}\n\nDate: {date}\nURL: {self.base_url}/p/{slug}\n\n{md_content}"
 
-            with open(os.path.join(output_dir, f"{filename_base}.md"), 'w') as f:
+            os.makedirs(md_dir, exist_ok=True)
+            with open(os.path.join(md_dir, f"{filename_base}.md"), 'w') as f:
                 f.write(full_md)
 
         return filename_base
