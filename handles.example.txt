@@ -4,3 +4,8 @@
 https://read.substack.com      # full URL
 newsletter.pragmaticengineer.com  # custom domain
 platformer                     # bare handle -> platformer.substack.com
+@renstacks                     # profile handle -> resolves to its publication
+
+# Note: a profile handle (@name) is NOT the same as the publication subdomain
+# (e.g. @renstacks publishes at rensub.substack.com). Using @name lets the tool
+# resolve it for you, so you don't have to find the subdomain yourself.

@@ -16,6 +16,8 @@ A tool to **archive** Substack newsletters you are currently subscribed to. This
 ## Features
 
 - **Personal Archive**: Download all posts from a newsletter to your local machine.
+- **Profile Handles**: Pass a profile (`@name` or `https://substack.com/@name`) and the tool resolves it to that author's publication — no need to hunt for the subdomain.
+- **Single Post**: Pass a reader URL (`https://substack.com/home/post/p-<id>`) to download just that one post.
 - **Bulk Mode**: Pass a text file of handles (`--file`) to archive many newsletters in one run.
 - **De-duplication**: Remembers what it has already downloaded, so re-running only fetches new posts.
 - **Paid Content Support**: Authenticates using your existing subscription to archive subscriber-only posts.
@@ -79,13 +81,31 @@ Newsletters with their own domains are isolated "islands" and require their own 
 ## Usage
 
 A handle can be a full URL (`https://read.substack.com`), a bare domain
-(`newsletter.pragmaticengineer.com`), or a bare Substack handle (`platformer`,
-which expands to `platformer.substack.com`).
+(`newsletter.pragmaticengineer.com`), a bare Substack handle (`platformer`,
+which expands to `platformer.substack.com`), or a profile handle (`@renstacks`
+or `https://substack.com/@renstacks`).
 
 **Basic Scrape** (single newsletter, HTML + Markdown):
 ```bash
 uv run scraper.py --url https://read.substack.com
 ```
+
+**By Profile Handle** (resolves to the author's publication):
+```bash
+uv run scraper.py --url @renstacks
+```
+Substack's UI hides the publication subdomain, and the profile handle often
+differs from it (`@renstacks` publishes at `rensub.substack.com`). Passing the
+`@handle` lets the tool resolve the publication for you via Substack's public
+profile API, so you don't have to find the subdomain yourself.
+
+**Single Post** (from a Substack reader URL):
+```bash
+uv run scraper.py --url https://substack.com/home/post/p-201072791
+```
+These centralized reader URLs reference a post by numeric id. The tool resolves
+the id to its publication and downloads just that one post (into the matching
+newsletter folder), rather than archiving the whole newsletter.
 
 **Bulk Scrape** (many newsletters from a file):
 ```bash

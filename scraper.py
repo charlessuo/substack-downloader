@@ -17,6 +17,31 @@ load_dotenv()
 # Name of the per-handle manifest used for de-duplication.
 MANIFEST_NAME = ".downloaded.json"
 
+# Centralized reader URLs look like https://substack.com/home/post/p-<id>
+# and reference a post by numeric id rather than publication + slug.
+READER_POST_RE = re.compile(r"substack\.com/home/post/p-(\d+)")
+
+
+def resolve_reader_post(url):
+    """Return the numeric post id if url is a substack.com reader URL, else None."""
+    match = READER_POST_RE.search(url)
+    return match.group(1) if match else None
+
+
+# Profile handles look like substack.com/@<handle> or a bare @<handle>. The
+# profile slug often differs from the publication subdomain (e.g. @renstacks
+# publishes at rensub.substack.com), so it must be resolved via the API.
+PROFILE_URL_RE = re.compile(r"substack\.com/@([\w.-]+)")
+PROFILE_BARE_RE = re.compile(r"^@([\w.-]+)$")
+
+
+def resolve_profile_handle(handle):
+    """Return the profile username if handle is a substack.com/@<user> URL or
+    a bare @<user>, else None."""
+    handle = handle.strip()
+    match = PROFILE_BARE_RE.match(handle) or PROFILE_URL_RE.search(handle)
+    return match.group(1) if match else None
+
 
 def resolve_handle(handle):
     """Turn a handle/URL into a (base_url, handle_name) pair.
@@ -136,6 +161,38 @@ class SubstackScraper:
             return response.json()
         except requests.exceptions.RequestException as e:
             print(f"Error fetching post {slug}: {e}")
+            return None
+
+    def get_public_profile(self, username):
+        """Fetch a user's public profile via the global Substack API.
+
+        Used to resolve a substack.com/@<handle> profile to its primary
+        publication, since the profile URL doesn't carry the publication's
+        domain. Returns the profile dict or None.
+        """
+        url = f"https://substack.com/api/v1/user/{username}/public_profile"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error resolving profile @{username}: {e}")
+            return None
+
+    def get_post_by_id(self, post_id):
+        """Resolve a post by its numeric id via the global Substack API.
+
+        Used for centralized reader URLs (substack.com/home/post/p-<id>),
+        which don't carry the publication's domain or slug. Returns the
+        post metadata dict (including canonical_url and slug) or None.
+        """
+        url = f"https://substack.com/api/v1/posts/by-id/{post_id}"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json().get("post", {})
+        except requests.exceptions.RequestException as e:
+            print(f"Error resolving post id {post_id}: {e}")
             return None
 
     def embed_image(self, img_url):
@@ -406,15 +463,12 @@ def find_session_file(domain):
     return None
 
 
-def process_handle(handle, args, output_root):
-    """Resolve, authenticate, and scrape a single handle."""
-    base_url, name = resolve_handle(handle)
-    if not base_url:
-        return 0
+def build_scraper(base_url, name, args):
+    """Build a scraper and authenticate it.
 
+    Auth priority: 1) CLI cookie  2) session file  3) .env cookie
+    """
     scraper = SubstackScraper(base_url, name, args.cookie)
-
-    # Auth priority: 1) CLI cookie  2) session file  3) .env cookie
     if not args.cookie:
         domain = urlparse(base_url).netloc
         session_file = find_session_file(domain)
@@ -424,6 +478,91 @@ def process_handle(handle, args, output_root):
             env_cookie = os.getenv("SUBSTACK_SID")
             if env_cookie:
                 scraper = SubstackScraper(base_url, name, env_cookie)
+    return scraper
+
+
+def resolve_profile_to_publication(username, args):
+    """Resolve a substack.com profile handle to its primary publication.
+
+    Returns a (base_url, name) pair, or (None, None) if it can't be resolved.
+    """
+    resolver = build_scraper("https://substack.com", "substack", args)
+    profile = resolver.get_public_profile(username)
+    pub = (profile or {}).get("primaryPublication") or {}
+
+    # Prefer a custom domain; otherwise fall back to the substack subdomain.
+    domain = pub.get("custom_domain")
+    if not domain and pub.get("subdomain"):
+        domain = f"{pub['subdomain']}.substack.com"
+    if not domain:
+        print(f"Could not resolve profile @{username} to a publication.")
+        return None, None
+
+    base_url, name = resolve_handle(domain)
+    print(f"Resolved @{username} -> {base_url}")
+    return base_url, name
+
+
+def process_single_post(post_id, args, output_root):
+    """Download a single post identified by its numeric id (reader URLs)."""
+    # Resolve the id against the global API to find its publication and slug.
+    resolver = build_scraper("https://substack.com", "substack", args)
+    meta = resolver.get_post_by_id(post_id)
+    if not meta or not meta.get("canonical_url"):
+        print(f"Could not resolve post id {post_id} to a publication URL.")
+        return 0
+
+    # canonical_url includes the post path; resolve against the publication root.
+    base_url, name = resolve_handle(urlparse(meta["canonical_url"]).netloc)
+    slug = meta.get("slug")
+    if not slug:
+        print(f"Post id {post_id} has no slug; cannot download.")
+        return 0
+
+    print(f"Resolved post id {post_id} -> {meta['canonical_url']}")
+
+    scraper = build_scraper(base_url, name, args)
+    scraper.html_only = args.html_only
+    scraper.md_only = args.md_only
+
+    output_dir = os.path.join(output_root, sanitize(name, 60))
+    os.makedirs(output_dir, exist_ok=True)
+
+    manifest = scraper._load_manifest(output_dir)
+    pid = str(meta.get("id") or slug)
+    if pid in manifest:
+        print(f"Already downloaded: {manifest[pid]}")
+        return 0
+
+    full_post = scraper.get_post(slug)
+    saved = scraper.save_post(full_post, output_dir) if full_post else None
+    if not saved:
+        print(f"Failed to download post {slug}.")
+        return 0
+
+    manifest[pid] = saved
+    scraper._save_manifest(output_dir, manifest)
+    print(f"Downloaded: {saved}")
+    return 1
+
+
+def process_handle(handle, args, output_root):
+    """Resolve, authenticate, and scrape a single handle."""
+    # A centralized reader URL points at one specific post, not a whole archive.
+    post_id = resolve_reader_post(handle)
+    if post_id:
+        return process_single_post(post_id, args, output_root)
+
+    # A profile handle (@user) resolves to its primary publication's archive.
+    profile = resolve_profile_handle(handle)
+    if profile:
+        base_url, name = resolve_profile_to_publication(profile, args)
+    else:
+        base_url, name = resolve_handle(handle)
+    if not base_url:
+        return 0
+
+    scraper = build_scraper(base_url, name, args)
 
     output_dir = os.path.join(output_root, sanitize(name, 60))
     return scraper.scrape(
