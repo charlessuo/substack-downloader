@@ -28,6 +28,21 @@ def resolve_reader_post(url):
     return match.group(1) if match else None
 
 
+# Profile handles look like substack.com/@<handle> or a bare @<handle>. The
+# profile slug often differs from the publication subdomain (e.g. @renstacks
+# publishes at rensub.substack.com), so it must be resolved via the API.
+PROFILE_URL_RE = re.compile(r"substack\.com/@([\w.-]+)")
+PROFILE_BARE_RE = re.compile(r"^@([\w.-]+)$")
+
+
+def resolve_profile_handle(handle):
+    """Return the profile username if handle is a substack.com/@<user> URL or
+    a bare @<user>, else None."""
+    handle = handle.strip()
+    match = PROFILE_BARE_RE.match(handle) or PROFILE_URL_RE.search(handle)
+    return match.group(1) if match else None
+
+
 def resolve_handle(handle):
     """Turn a handle/URL into a (base_url, handle_name) pair.
 
@@ -146,6 +161,22 @@ class SubstackScraper:
             return response.json()
         except requests.exceptions.RequestException as e:
             print(f"Error fetching post {slug}: {e}")
+            return None
+
+    def get_public_profile(self, username):
+        """Fetch a user's public profile via the global Substack API.
+
+        Used to resolve a substack.com/@<handle> profile to its primary
+        publication, since the profile URL doesn't carry the publication's
+        domain. Returns the profile dict or None.
+        """
+        url = f"https://substack.com/api/v1/user/{username}/public_profile"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error resolving profile @{username}: {e}")
             return None
 
     def get_post_by_id(self, post_id):
@@ -450,6 +481,28 @@ def build_scraper(base_url, name, args):
     return scraper
 
 
+def resolve_profile_to_publication(username, args):
+    """Resolve a substack.com profile handle to its primary publication.
+
+    Returns a (base_url, name) pair, or (None, None) if it can't be resolved.
+    """
+    resolver = build_scraper("https://substack.com", "substack", args)
+    profile = resolver.get_public_profile(username)
+    pub = (profile or {}).get("primaryPublication") or {}
+
+    # Prefer a custom domain; otherwise fall back to the substack subdomain.
+    domain = pub.get("custom_domain")
+    if not domain and pub.get("subdomain"):
+        domain = f"{pub['subdomain']}.substack.com"
+    if not domain:
+        print(f"Could not resolve profile @{username} to a publication.")
+        return None, None
+
+    base_url, name = resolve_handle(domain)
+    print(f"Resolved @{username} -> {base_url}")
+    return base_url, name
+
+
 def process_single_post(post_id, args, output_root):
     """Download a single post identified by its numeric id (reader URLs)."""
     # Resolve the id against the global API to find its publication and slug.
@@ -500,7 +553,12 @@ def process_handle(handle, args, output_root):
     if post_id:
         return process_single_post(post_id, args, output_root)
 
-    base_url, name = resolve_handle(handle)
+    # A profile handle (@user) resolves to its primary publication's archive.
+    profile = resolve_profile_handle(handle)
+    if profile:
+        base_url, name = resolve_profile_to_publication(profile, args)
+    else:
+        base_url, name = resolve_handle(handle)
     if not base_url:
         return 0
 
