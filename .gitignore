@@ -15,3 +15,6 @@ archive/
 # Secrets / Sessions
 substack_session*.json
 *.har
+
+# Actual handles
+handles.txt
